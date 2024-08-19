@@ -963,10 +963,9 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 Direction::Backward => offset.anchor.saturating_sub(preview_scroll_offset.1),
                 Direction::Forward => offset.anchor.saturating_add(preview_scroll_offset.1),
             };
-
             let syntax_highlights = EditorView::doc_syntax_highlights(
                 doc,
-                offset.anchor,
+                doc.text().slice(..).line_to_char(offset.vertical_offset),
                 area.height,
                 &cx.editor.theme,
             );
