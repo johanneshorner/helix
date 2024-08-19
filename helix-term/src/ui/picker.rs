@@ -1200,10 +1200,10 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                     Direction::Forward,
                 );
             }
-            alt!('b') if self.show_preview => {
+            alt!('b') | alt!(PageUp) if self.show_preview => {
                 self.move_preview_by(self.preview_height as usize, Direction::Backward);
             }
-            alt!('f') if self.show_preview => {
+            alt!('f') | alt!(PageDown) if self.show_preview => {
                 self.move_preview_by(self.preview_height as usize, Direction::Forward);
             }
             _ => {
