@@ -970,8 +970,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 &cx.editor.theme,
             );
 
-            let mut overlay_highlights =
-                EditorView::empty_highlight_iter(doc, offset.anchor, area.height);
+            let mut overlay_highlights = EditorView::empty_highlight_iter(
+                doc,
+                doc.text().slice(..).line_to_char(offset.vertical_offset),
+                area.height,
+            );
             for spans in EditorView::doc_diagnostics_highlights(doc, &cx.editor.theme) {
                 if spans.is_empty() {
                     continue;
