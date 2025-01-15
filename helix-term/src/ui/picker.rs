@@ -934,32 +934,37 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 }
             }
 
-            // limit scroll offset between [-offset.anchor, doc.text().len_lines() - offset.anchor - preview height]
+            let mut current_line = doc.text().slice(..).char_to_line(offset.anchor);
+
             preview_scroll_offset.1 = match preview_scroll_offset.0 {
-                Direction::Backward => preview_scroll_offset.1.min(offset.anchor),
+                Direction::Backward => preview_scroll_offset.1.min(current_line),
                 Direction::Forward => preview_scroll_offset.1.min(
                     doc_height
-                        .saturating_sub(offset.anchor)
+                        .saturating_sub(current_line)
                         .saturating_sub(inner.height as usize),
                 ),
             };
 
-            offset.vertical_offset = match preview_scroll_offset.0 {
-                Direction::Backward => offset.anchor.saturating_sub(preview_scroll_offset.1),
-                Direction::Forward => offset.anchor.saturating_add(preview_scroll_offset.1),
+            offset.anchor = match preview_scroll_offset.0 {
+                Direction::Backward => doc
+                    .text()
+                    .slice(..)
+                    .line_to_char(current_line.saturating_sub(preview_scroll_offset.1)),
+                Direction::Forward => doc
+                    .text()
+                    .slice(..)
+                    .line_to_char(current_line.saturating_add(preview_scroll_offset.1)),
             };
+
             let syntax_highlights = EditorView::doc_syntax_highlights(
                 doc,
-                doc.text().slice(..).line_to_char(offset.vertical_offset),
+                offset.anchor,
                 area.height,
                 &cx.editor.theme,
             );
 
-            let mut overlay_highlights = EditorView::empty_highlight_iter(
-                doc,
-                doc.text().slice(..).line_to_char(offset.vertical_offset),
-                area.height,
-            );
+            let mut overlay_highlights =
+                EditorView::empty_highlight_iter(doc, offset.anchor, area.height);
             for spans in EditorView::doc_diagnostics_highlights(doc, &cx.editor.theme) {
                 if spans.is_empty() {
                     continue;
@@ -988,6 +993,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 decorations.add_decoration(draw_highlight);
             }
 
+            current_line = doc.text().slice(..).char_to_line(offset.anchor);
+
             render_document(
                 surface,
                 inner,
@@ -1006,7 +1013,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             let win_height = inner.height as usize;
             let len = doc_height;
             let fits = len <= win_height;
-            let scroll = offset.vertical_offset;
+            let scroll = current_line;
             let scroll_style = cx.editor.theme.get("ui.menu.scroll");
 
             const fn div_ceil(a: usize, b: usize) -> usize {
