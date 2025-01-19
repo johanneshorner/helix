@@ -632,7 +632,7 @@ impl EditorView {
 
         let mut x = viewport.x;
 
-        let current_tab = editor.tabs.focus;
+        let current_tab = editor.tabs.focus();
         for (id, tab) in editor.tabs.iter_tabs() {
             let style = if current_tab == id {
                 tabline_active

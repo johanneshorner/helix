@@ -3016,7 +3016,7 @@ fn file_picker_in_current_directory(cx: &mut Context) {
 }
 
 fn tab_picker(cx: &mut Context) {
-    let current = cx.editor.tabs.focus;
+    let current = cx.editor.tabs.focus();
 
     #[derive(Debug)]
     struct TabMeta {
@@ -3024,22 +3024,22 @@ fn tab_picker(cx: &mut Context) {
         id: TabId,
         name: String,
         is_current: bool,
+        focused_at: std::time::Instant,
     }
 
-    impl ui::menu::Item for TabMeta {
-        type Data = ();
-
-        fn format(&self, _data: &Self::Data) -> Row {
+    let columns = [
+        PickerColumn::new("idx", |meta: &TabMeta, _| meta.idx.to_string().into()),
+        PickerColumn::new("name", |meta: &TabMeta, _| meta.name.clone().into()),
+        PickerColumn::new("flags", |meta: &TabMeta, _| {
             let mut flags = String::new();
-            if self.is_current {
+            if meta.is_current {
                 flags.push('*');
             }
+            flags.into()
+        }),
+    ];
 
-            Row::new([(self.idx + 1).to_string(), self.name.clone(), flags])
-        }
-    }
-
-    let opts = cx
+    let mut items = cx
         .editor
         .tabs
         .iter_tabs()
@@ -3049,11 +3049,15 @@ fn tab_picker(cx: &mut Context) {
             id,
             name: tab.name.clone(),
             is_current: id == current,
+            focused_at: tab.focused_at,
         })
-        .collect();
+        .collect::<Vec<TabMeta>>();
 
-    let picker = Picker::new(opts, (), |cx, meta, _action| {
-        cx.editor.tabs.focus = meta.id;
+    // mru
+    items.sort_unstable_by_key(|item| std::cmp::Reverse(item.focused_at));
+
+    let picker = Picker::new(columns, 0, items, (), |cx, meta, _action| {
+        cx.editor.tabs.set_focus(meta.id);
     });
 
     cx.push_layer(Box::new(overlaid(picker)));

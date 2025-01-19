@@ -1690,7 +1690,10 @@ impl Editor {
                 return;
             }
             Action::HorizontalSplit | Action::VerticalSplit => {
-                let focus_lost = self.tree.try_get(self.tree.focus).map(|view| view.doc);
+                let current_tree = self.tabs.curr_tree();
+                let focus_lost = current_tree
+                    .try_get(current_tree.focus)
+                    .map(|view| view.doc);
                 // copy the current view, unless there is no view yet
                 let focus = self.tabs.curr_tree().focus;
                 let view = self
@@ -1967,7 +1970,7 @@ impl Editor {
             let view = view!(self, view_id);
             let doc = doc_mut!(self, &view.doc);
             doc.mark_as_focused();
-            let focus_lost = self.tree.get(prev_id).doc;
+            let focus_lost = self.tabs.curr_tree().get(prev_id).doc;
             dispatch(DocumentFocusLost {
                 editor: self,
                 doc: focus_lost,

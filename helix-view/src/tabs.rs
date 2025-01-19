@@ -6,11 +6,19 @@ use crate::{graphics::Rect, tree::Tree, TabId};
 pub struct Tab {
     pub name: String,
     pub tree: Tree,
+    pub focused_at: std::time::Instant,
+}
+
+impl Tab {
+    /// Mark tab as recent; used for MRU sorting
+    pub fn mark_as_focused(&mut self) {
+        self.focused_at = std::time::Instant::now();
+    }
 }
 
 #[derive(Debug)]
 pub struct Tabs {
-    pub focus: TabId,
+    focus: TabId,
     tabs: HopSlotMap<TabId, Tab>,
 }
 
@@ -21,6 +29,7 @@ impl Tabs {
         let tab = Tab {
             name: "Tab 0".to_string(),
             tree: Tree::new(area),
+            focused_at: std::time::Instant::now(),
         };
         let focus = tabs.insert(tab);
         Self { focus, tabs }
@@ -52,14 +61,26 @@ impl Tabs {
     }
 
     #[inline]
+    pub fn set_focus(&mut self, id: TabId) {
+        self.focus = id;
+        self.tabs[id].mark_as_focused();
+    }
+
+    #[inline]
+    pub fn focus(&self) -> TabId {
+        self.focus
+    }
+
+    #[inline]
     pub fn new_tab(&mut self) -> TabId {
         let area = self.curr_tree().area();
         let new_tab = Tab {
             name: format!("Tab {}", self.tabs.len()),
             tree: Tree::new(area),
+            focused_at: std::time::Instant::now(),
         };
         let new_focus = self.tabs.insert(new_tab);
-        self.focus = new_focus;
+        self.set_focus(new_focus);
         new_focus
     }
 
@@ -69,7 +90,7 @@ impl Tabs {
         let mut iter = self.tabs.keys().skip_while(|id| *id != curr);
         iter.next();
         let id = iter.next().or_else(|| self.tabs.keys().next()).unwrap();
-        self.focus = id;
+        self.set_focus(id);
         id
     }
 
@@ -78,7 +99,7 @@ impl Tabs {
         let curr = self.focus;
         let iter = self.tabs.keys().take_while(|id| *id != curr);
         let id = iter.last().or_else(|| self.tabs.keys().last()).unwrap();
-        self.focus = id;
+        self.set_focus(id);
         id
     }
 

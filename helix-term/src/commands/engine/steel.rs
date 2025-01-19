@@ -936,8 +936,8 @@ fn string_to_color(string: SteelString) -> Result<Color, anyhow::Error> {
 }
 
 fn current_buffer_area(cx: &mut Context) -> Option<helix_view::graphics::Rect> {
-    let focus = cx.editor.tree.focus;
-    cx.editor.tree.view_id_area(focus)
+    let focus = cx.editor.tabs.curr_tree().focus;
+    cx.editor.tabs.curr_tree().view_id_area(focus)
 }
 
 fn load_editor_api(engine: &mut Engine, generate_sources: bool) {
@@ -1269,8 +1269,8 @@ impl SteelScriptingEngine {
         // Get the currently activated extension, also need to check the
         // buffer type.
         let extension = {
-            let current_focus = cx.editor.tree.focus;
-            let view = cx.editor.tree.get(current_focus);
+            let current_focus = cx.editor.tabs.curr_tree().focus;
+            let view = cx.editor.tabs.curr_tree().get(current_focus);
             let doc = &view.doc;
             let current_doc = cx.editor.documents.get(doc);
 
@@ -1281,8 +1281,8 @@ impl SteelScriptingEngine {
         };
 
         let doc_id = {
-            let current_focus = cx.editor.tree.focus;
-            let view = cx.editor.tree.get(current_focus);
+            let current_focus = cx.editor.tabs.curr_tree().focus;
+            let view = cx.editor.tabs.curr_tree().get(current_focus);
             let doc = &view.doc;
 
             doc
@@ -2720,8 +2720,8 @@ fn get_init_scm_path() -> String {
 /// Get the current path! See if this can be done _without_ this function?
 // TODO:
 fn current_path(cx: &mut Context) -> Option<String> {
-    let current_focus = cx.editor.tree.focus;
-    let view = cx.editor.tree.get(current_focus);
+    let current_focus = cx.editor.tabs.curr_tree().focus;
+    let view = cx.editor.tabs.curr_tree().get(current_focus);
     let doc = &view.doc;
     // Lifetime of this needs to be tied to the existing document
     let current_doc = cx.editor.documents.get(doc);
@@ -2729,8 +2729,8 @@ fn current_path(cx: &mut Context) -> Option<String> {
 }
 
 fn set_scratch_buffer_name(cx: &mut Context, name: String) {
-    let current_focus = cx.editor.tree.focus;
-    let view = cx.editor.tree.get(current_focus);
+    let current_focus = cx.editor.tabs.curr_tree().focus;
+    let view = cx.editor.tabs.curr_tree().get(current_focus);
     let doc = &view.doc;
     // Lifetime of this needs to be tied to the existing document
     let current_doc = cx.editor.documents.get_mut(doc);
@@ -2741,11 +2741,11 @@ fn set_scratch_buffer_name(cx: &mut Context, name: String) {
 }
 
 fn cx_current_focus(cx: &mut Context) -> helix_view::ViewId {
-    cx.editor.tree.focus
+    cx.editor.tabs.curr_tree().focus
 }
 
 fn cx_get_document_id(cx: &mut Context, view_id: helix_view::ViewId) -> DocumentId {
-    cx.editor.tree.get(view_id).doc
+    cx.editor.tabs.curr_tree().get(view_id).doc
 }
 
 fn document_id_to_text(cx: &mut Context, doc_id: DocumentId) -> Option<SteelRopeSlice> {
@@ -2757,7 +2757,8 @@ fn document_id_to_text(cx: &mut Context, doc_id: DocumentId) -> Option<SteelRope
 
 fn cx_is_document_in_view(cx: &mut Context, doc_id: DocumentId) -> Option<helix_view::ViewId> {
     cx.editor
-        .tree
+        .tabs
+        .curr_tree()
         .traverse()
         .find(|(_, v)| v.doc == doc_id)
         .map(|(id, _)| id)
@@ -3127,7 +3128,8 @@ fn replace_selection(cx: &mut Context, value: String) {
 fn move_window_to_the_left(cx: &mut Context) {
     while cx
         .editor
-        .tree
+        .tabs
+        .curr_tree_mut()
         .swap_split_in_direction(helix_view::tree::Direction::Left)
         .is_some()
     {}
@@ -3137,7 +3139,8 @@ fn move_window_to_the_left(cx: &mut Context) {
 fn move_window_to_the_right(cx: &mut Context) {
     while cx
         .editor
-        .tree
+        .tabs
+        .curr_tree_mut()
         .swap_split_in_direction(helix_view::tree::Direction::Right)
         .is_some()
     {}
