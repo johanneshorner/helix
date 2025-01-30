@@ -46,10 +46,11 @@ slotmap = "1.0.7"
 steel-core = { git = "https://github.com/mattwparas/steel.git", version = "0.6.0", features = ["anyhow", "dylibs", "sync"] }
 thiserror = "2.0"
 tempfile = "3.15.0"
-bitflags = "2.7"
+bitflags = "2.8"
+unicode-segmentation = "1.2"
 
 [workspace.package]
-version = "25.1.0"
+version = "25.1.1"
 edition = "2021"
 authors = ["Blaž Hrastnik <blaz@mxxn.io>"]
 categories = ["editor"]
