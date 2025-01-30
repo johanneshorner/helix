@@ -287,6 +287,7 @@ impl Application {
             crate::commands::ScriptingEngine::run_initialization_script(
                 &mut cx,
                 app.config.clone(),
+                app.syn_loader.clone(),
             );
         }
 

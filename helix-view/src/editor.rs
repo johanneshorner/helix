@@ -2,9 +2,10 @@ use crate::{
     annotations::diagnostics::{DiagnosticFilter, InlineDiagnosticsConfig},
     clipboard::ClipboardProvider,
     document::{
-        DocumentOpenError, DocumentSavedEventFuture, DocumentSavedEventResult, Mode, SavePoint,
+        DocumentOpenError, DocumentSavedEvent, DocumentSavedEventFuture, DocumentSavedEventResult,
+        Mode, SavePoint,
     },
-    events::DocumentFocusLost,
+    events::{DocumentClosed, DocumentFocusLost, DocumentOpened, DocumentSaved},
     graphics::{CursorKind, Rect},
     handlers::Handlers,
     info::Info,
@@ -1806,6 +1807,11 @@ impl Editor {
             let id = self.new_document(doc);
             self.launch_language_servers(id);
 
+            dispatch(DocumentOpened {
+                editor: self,
+                doc: id,
+            });
+
             id
         };
 
@@ -1899,6 +1905,11 @@ impl Editor {
 
         self._refresh();
 
+        dispatch(DocumentClosed {
+            editor: self,
+            doc: doc_id,
+        });
+
         Ok(())
     }
 
@@ -1936,6 +1947,11 @@ impl Editor {
 
         self.write_count += 1;
 
+        dispatch(DocumentSaved {
+            editor: self,
+            doc: doc_id,
+        });
+
         Ok(())
     }
 
@@ -1955,8 +1971,6 @@ impl Editor {
         // if leaving the view: mode should reset and the cursor should be
         // within view
         if prev_id != view_id {
-            log::info!("Changing focus: {:?}", view_id);
-
             // TODO: Consult map for modes to change given file type?
 
             self.enter_normal_mode();
