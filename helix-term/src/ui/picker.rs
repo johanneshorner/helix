@@ -1165,10 +1165,10 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             key!(Tab) | key!(Down) | ctrl!('n') => {
                 self.move_by(1, Direction::Forward);
             }
-            key!(PageDown) | ctrl!('d') if !self.show_preview => {
+            key!(PageDown) if !self.show_preview => {
                 self.page_down();
             }
-            key!(PageUp) | ctrl!('u') if !self.show_preview => {
+            key!(PageUp) if !self.show_preview => {
                 self.page_up();
             }
             key!(Home) => {
@@ -1245,13 +1245,13 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                     Direction::Forward,
                 );
             }
-            alt!('u') if self.show_preview => {
+            alt!('u') | ctrl!('u') if self.show_preview => {
                 self.move_preview_by(
                     self.preview_height.saturating_div(2) as usize,
                     Direction::Backward,
                 );
             }
-            alt!('d') if self.show_preview => {
+            alt!('d') | ctrl!('d') if self.show_preview => {
                 self.move_preview_by(
                     self.preview_height.saturating_div(2) as usize,
                     Direction::Forward,
