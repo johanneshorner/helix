@@ -21,6 +21,7 @@ use tui::backend::Backend;
 
 use crate::{
     args::Args,
+    commands::ScriptingEngine,
     compositor::{Compositor, Event},
     config::Config,
     handlers,
@@ -234,7 +235,7 @@ impl Application {
         ])
         .context("build signal handler")?;
 
-        let app = Self {
+        let mut app = Self {
             compositor,
             terminal,
             editor,
@@ -243,6 +244,26 @@ impl Application {
             jobs: Jobs::new(),
             lsp_progress: LspProgressMap::new(),
         };
+
+        {
+            // TODO: Revisit this!
+            let syn_loader = app.editor.syn_loader.clone();
+
+            let mut cx = crate::commands::Context {
+                register: None,
+                count: std::num::NonZeroUsize::new(1),
+                editor: &mut app.editor,
+                callback: Vec::new(),
+                on_next_key_callback: None,
+                jobs: &mut app.jobs,
+            };
+
+            crate::commands::ScriptingEngine::run_initialization_script(
+                &mut cx,
+                app.config.clone(),
+                syn_loader,
+            );
+        }
 
         Ok(app)
     }
@@ -334,6 +355,10 @@ impl Application {
                     self.jobs.handle_callback(&mut self.editor, &mut self.compositor, callback);
                     self.render().await;
                 }
+                Some(callback) = self.jobs.local_futures.next() => {
+                    self.jobs.handle_local_callback(&mut self.editor, &mut self.compositor, callback);
+                    self.render().await;
+                }
                 event = self.editor.wait_event() => {
                     let _idle_handled = self.handle_editor_event(event).await;
 
@@ -370,6 +395,7 @@ impl Application {
                 };
                 self.config.store(Arc::new(app_config));
             }
+            ConfigEvent::Change => {}
         }
 
         // Update all the relevant members in the editor after updating
@@ -384,32 +410,30 @@ impl Application {
         }
     }
 
-    /// refresh language config after config change
-    fn refresh_language_config(&mut self) -> Result<(), Error> {
-        let lang_loader = helix_core::config::user_lang_loader()?;
-
-        self.editor.syn_loader.store(Arc::new(lang_loader));
-        let loader = self.editor.syn_loader.load();
-        for document in self.editor.documents.values_mut() {
-            document.detect_language(&loader);
-            let diagnostics = Editor::doc_diagnostics(
-                &self.editor.language_servers,
-                &self.editor.diagnostics,
-                document,
-            );
-            document.replace_diagnostics(diagnostics, &[], None);
-        }
-
-        Ok(())
-    }
-
     fn refresh_config(&mut self) {
         let mut refresh_config = || -> Result<(), Error> {
             let default_config = Config::load_default()
                 .map_err(|err| anyhow::anyhow!("Failed to load config: {}", err))?;
-            self.refresh_language_config()?;
-            // Refresh theme after config change
+
+            // Update the syntax language loader before setting the theme. Setting the theme will
+            // call `Loader::set_scopes` which must be done before the documents are re-parsed for
+            // the sake of locals highlighting.
+            let lang_loader = helix_core::config::user_lang_loader()?;
+            self.editor.syn_loader.store(Arc::new(lang_loader));
             Self::load_configured_theme(&mut self.editor, &default_config);
+
+            // Re-parse any open documents with the new language config.
+            let lang_loader = self.editor.syn_loader.load();
+            for document in self.editor.documents.values_mut() {
+                document.detect_language(&lang_loader);
+                let diagnostics = Editor::doc_diagnostics(
+                    &self.editor.language_servers,
+                    &self.editor.diagnostics,
+                    document,
+                );
+                document.replace_diagnostics(diagnostics, &[], None);
+            }
+
             self.terminal
                 .reconfigure(default_config.editor.clone().into())?;
             // Store new config
@@ -857,6 +881,19 @@ impl Application {
 
                         // Remove the language server from the registry.
                         self.editor.language_servers.remove_by_id(server_id);
+                    }
+                    Notification::Other(event_name, params) => {
+                        let server_id = server_id;
+
+                        let mut cx = crate::compositor::Context {
+                            editor: &mut self.editor,
+                            scroll: None,
+                            jobs: &mut self.jobs,
+                        };
+
+                        ScriptingEngine::handle_lsp_notification(
+                            &mut cx, server_id, event_name, params,
+                        );
                     }
                 }
             }

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use helix_core::indent::IndentStyle;
 use helix_core::{coords_at_pos, encoding, Position};
 use helix_lsp::lsp::DiagnosticSeverity;
 use helix_view::document::DEFAULT_LANGUAGE_NAME;
@@ -142,6 +143,7 @@ where
         helix_view::editor::StatusLineElement::ReadOnlyIndicator => render_read_only_indicator,
         helix_view::editor::StatusLineElement::FileEncoding => render_file_encoding,
         helix_view::editor::StatusLineElement::FileLineEnding => render_file_line_ending,
+        helix_view::editor::StatusLineElement::FileIndentStyle => render_file_indent_style,
         helix_view::editor::StatusLineElement::FileType => render_file_type,
         helix_view::editor::StatusLineElement::Diagnostics => render_diagnostics,
         helix_view::editor::StatusLineElement::WorkspaceDiagnostics => render_workspace_diagnostics,
@@ -452,6 +454,7 @@ where
         let path = rel_path
             .as_ref()
             .map(|p| p.to_string_lossy())
+            .or_else(|| context.doc.name.as_ref().map(|x| x.into()))
             .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into());
         format!(" {} ", path)
     };
@@ -509,6 +512,7 @@ where
         let path = rel_path
             .as_ref()
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy()))
+            .or_else(|| context.doc.name.as_ref().map(|x| x.into()))
             .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into());
         format!(" {} ", path)
     };
@@ -553,4 +557,21 @@ where
     if let Some(reg) = context.editor.selected_register {
         write(context, format!(" reg={} ", reg).into())
     }
+}
+
+fn render_file_indent_style<'a, F>(context: &mut RenderContext<'a>, write: F)
+where
+    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+{
+    let style = context.doc.indent_style;
+
+    write(
+        context,
+        match style {
+            IndentStyle::Tabs => " tabs ".into(),
+            IndentStyle::Spaces(indent) => {
+                format!(" {} space{} ", indent, if indent == 1 { "" } else { "s" }).into()
+            }
+        },
+    );
 }
