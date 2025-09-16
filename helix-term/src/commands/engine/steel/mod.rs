@@ -1,3 +1,5 @@
+mod components;
+
 use arc_swap::{ArcSwap, ArcSwapAny};
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use helix_core::{
@@ -5,22 +7,26 @@ use helix_core::{
     diagnostic::Severity,
     extensions::steel_implementations::{rope_module, SteelRopeSlice},
     find_workspace, graphemes,
-    syntax::config::{
-        default_timeout, AutoPairConfig, LanguageConfiguration, LanguageServerConfiguration,
-        SoftWrap,
+    syntax::{
+        self,
+        config::{
+            default_timeout, AutoPairConfig, LanguageConfiguration, LanguageServerConfiguration,
+            SoftWrap,
+        },
     },
-    syntax::{self},
     text_annotations::InlineAnnotation,
-    Range, Selection, Tendril,
+    Range, Selection, Tendril, Transaction,
 };
 use helix_event::register_hook;
+use helix_lsp::jsonrpc;
 use helix_view::{
     annotations::diagnostics::DiagnosticFilter,
     document::{DocumentInlayHints, DocumentInlayHintsId, Mode},
     editor::{
         Action, AutoSave, BufferLine, ConfigEvent, CursorShapeConfig, FilePickerConfig,
         GutterConfig, IndentGuidesConfig, LineEndingConfig, LineNumber, LspConfig, SearchConfig,
-        SmartTabConfig, StatusLineConfig, TerminalConfig, WhitespaceConfig,
+        SmartTabConfig, StatusLineConfig, TerminalConfig, WhitespaceConfig, WhitespaceRender,
+        WhitespaceRenderValue,
     },
     events::{DocumentDidOpen, DocumentFocusLost, DocumentSaved, SelectionDidChange},
     extension::document_id_to_usize,
@@ -47,7 +53,7 @@ use std::{
     error::Error,
     io::Write,
     path::PathBuf,
-    sync::{atomic::AtomicBool, Mutex, MutexGuard, RwLock, RwLockReadGuard},
+    sync::{atomic::AtomicBool, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak},
     time::{Duration, SystemTime},
 };
 use std::{str::FromStr as _, sync::Arc};
@@ -56,35 +62,32 @@ use steel::{rvals::Custom, steel_vm::builtin::BuiltInModule};
 
 use crate::{
     // args::Args,
-    commands::insert,
+    commands::{insert, TYPABLE_COMMAND_LIST},
     compositor::{self, Component, Compositor},
     config::Config,
     events::{OnModeSwitch, PostCommand, PostInsertChar},
     job::{self, Callback},
-    keymap::{self, merge_keys, KeyTrie, KeymapResult},
+    keymap::{self, merge_keys, KeyTrie, KeymapResult, MappableCommand},
     ui::{self, picker::PathOrId, PickerColumn, Popup, Prompt, PromptEvent},
 };
 
 use components::SteelDynamicComponent;
 
-use super::{
-    components::{self, helix_component_module},
-    Context, MappableCommand, TYPABLE_COMMAND_LIST,
-};
-use insert::{insert_char, insert_string};
+use components::helix_component_module;
 
-pub static INTERRUPT_HANDLER: OnceCell<InterruptHandler> = OnceCell::new();
+use super::Context;
+use insert::insert_char;
+
+static INTERRUPT_HANDLER: OnceCell<InterruptHandler> = OnceCell::new();
+static SAFEPOINT_HANDLER: OnceCell<SafepointHandler> = OnceCell::new();
 
 // TODO: Use this for the available commands.
 // We just have to look at functions that have been defined at
 // the top level, _after_ they
-pub static GLOBAL_OFFSET: OnceCell<usize> = OnceCell::new();
+static GLOBAL_OFFSET: OnceCell<usize> = OnceCell::new();
 
 fn setup() -> Engine {
     let engine = steel::steel_vm::engine::Engine::new();
-
-    // Any function after this point can be used for looking at "new" functions
-    // GLOBAL_OFFSET.set(engine.readable_globals(0).len()).unwrap();
 
     let controller = engine.get_thread_state_controller();
     let running = Arc::new(AtomicBool::new(false));
@@ -124,6 +127,38 @@ fn setup() -> Engine {
         }
     });
 
+    let running_command = Arc::new(AtomicBool::new(true));
+    let running_command_clone = running_command.clone();
+
+    // Put the engine in a place where we can make substantive progress.
+    let safepoint_wakeup = std::thread::spawn(move || {
+        let running_command = running_command_clone;
+
+        loop {
+            // If this is running, don't acquire the lock. Park until we're back.
+            if running_command.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::park();
+                continue;
+            }
+
+            GLOBAL_ENGINE.lock().unwrap().enter_safepoint(|| {
+                // Set the thread to running, and then park it.
+                // Eventually it will be awoken once the engine
+                // exits the engine context
+                while !running_command.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::park();
+                }
+            });
+        }
+    });
+
+    SAFEPOINT_HANDLER
+        .set(SafepointHandler {
+            running_command,
+            handle: safepoint_wakeup,
+        })
+        .ok();
+
     INTERRUPT_HANDLER
         .set(InterruptHandler {
             controller: controller.clone(),
@@ -149,17 +184,66 @@ pub fn enter_engine<F, R>(f: F) -> R
 where
     F: FnOnce(&mut Engine) -> R,
 {
-    (f)(&mut acquire_engine_lock())
+    // Unpark the other thread, get it ready
+    let handler = SAFEPOINT_HANDLER.get();
+    if let Some(x) = handler {
+        x.running_command
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        x.handle.thread().unpark();
+    };
+
+    let res = f(&mut acquire_engine_lock());
+
+    if let Some(x) = handler {
+        x.running_command
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        x.handle.thread().unpark();
+    };
+
+    res
 }
 
 pub fn try_enter_engine<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut Engine) -> R,
 {
-    match GLOBAL_ENGINE.try_lock() {
-        Ok(mut v) => Some((f)(&mut v)),
-        Err(_) => None,
+    let handler = SAFEPOINT_HANDLER.get().unwrap();
+
+    // If we're currently running a command, we need to try lock against
+    // the lock since we don't want to lock up the engine explicitly.
+    if handler
+        .running_command
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let res = match GLOBAL_ENGINE.try_lock() {
+            Ok(mut v) => Some((f)(&mut v)),
+            Err(_) => None,
+        };
+
+        res
+    } else {
+        handler
+            .running_command
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        handler.handle.thread().unpark();
+
+        let res = match GLOBAL_ENGINE.lock() {
+            Ok(mut v) => Some((f)(&mut v)),
+            Err(_) => None,
+        };
+
+        handler
+            .running_command
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        handler.handle.thread().unpark();
+
+        res
     }
+}
+
+pub struct SafepointHandler {
+    running_command: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
 }
 
 pub struct InterruptHandler {
@@ -196,16 +280,57 @@ static BUFFER_EXTENSION_KEYMAP: Lazy<RwLock<BufferExtensionKeyMap>> = Lazy::new(
     })
 });
 
-pub static LSP_NOTIFICATION_REGISTRY: Lazy<RwLock<HashMap<(String, String), RootedSteelVal>>> =
+enum LspKind {
+    Call(RootedSteelVal),
+    Notification(RootedSteelVal),
+}
+
+static LSP_CALL_REGISTRY: Lazy<RwLock<HashMap<(String, String), LspKind>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+fn register_lsp_call_callback(lsp: String, kind: String, function: SteelVal) {
+    let rooted = function.as_rooted();
+
+    LSP_CALL_REGISTRY
+        .write()
+        .unwrap()
+        .insert((lsp, kind), LspKind::Call(rooted));
+}
 
 fn register_lsp_notification_callback(lsp: String, kind: String, function: SteelVal) {
     let rooted = function.as_rooted();
 
-    LSP_NOTIFICATION_REGISTRY
+    LSP_CALL_REGISTRY
         .write()
         .unwrap()
-        .insert((lsp, kind), rooted);
+        .insert((lsp, kind), LspKind::Notification(rooted));
+}
+
+fn send_arbitrary_lsp_notification(
+    cx: &mut Context,
+    name: SteelString,
+    method: SteelString,
+    params: Option<SteelVal>,
+) -> anyhow::Result<()> {
+    let argument = params.map(|x| serde_json::Value::try_from(x).unwrap());
+
+    let (_view, doc) = current!(cx.editor);
+
+    let language_server_id = anyhow::Context::context(
+        doc.language_servers().find(|x| x.name() == name.as_str()),
+        "Unable to find the language server specified!",
+    )?
+    .id();
+
+    let language_server = cx
+        .editor
+        .language_server_by_id(language_server_id)
+        .ok_or(anyhow::anyhow!("Failed to find a language server by id"))?;
+
+    // Send the notification using the custom method and arguments
+    language_server.send_custom_notification(method.to_string(), argument)?;
+
+    Ok(())
 }
 
 pub struct BufferExtensionKeyMap {
@@ -286,7 +411,7 @@ pub fn format_docstring(doc: &str) -> String {
         .map(|x| {
             let mut line = ";;".to_string();
             line.push_str(x);
-            line.push_str("\n");
+            line.push('\n');
             line
         })
         .collect::<String>();
@@ -413,16 +538,16 @@ fn load_static_commands(engine: &mut Engine, generate_sources: bool) {
     );
 
     function1!(
-        "cx->current-file",
-        current_path,
-        "Get the currently focused file path"
-    );
-
-    function1!(
         "enqueue-expression-in-engine",
         run_expression_in_engine,
         "Enqueue an expression to run at the top level context, 
         after the existing function context has exited."
+    );
+
+    function1!(
+        "get-current-line-character",
+        current_line_character,
+        "Returns the current column number with the given position encoding"
     );
 
     let mut template_function_arity_0 = |name: &str, doc: &str| {
@@ -450,7 +575,18 @@ fn load_static_commands(engine: &mut Engine, generate_sources: bool) {
     }
 
     function0!(
+        "cx->current-file",
+        current_path,
+        "Get the currently focused file path"
+    );
+
+    function0!(
         "current_selection",
+        get_selection,
+        "Returns the current selection as a string"
+    );
+    function0!(
+        "current-selection->string",
         get_selection,
         "Returns the current selection as a string"
     );
@@ -464,6 +600,11 @@ fn load_static_commands(engine: &mut Engine, generate_sources: bool) {
         "get-current-line-number",
         current_line_number,
         "Returns the current line number"
+    );
+    function0!(
+        "get-current-column-number",
+        current_column_number,
+        "Returns the visual current column number of unicode graphemes"
     );
     function0!(
         "current-selection-object",
@@ -613,15 +754,23 @@ fn load_typed_commands(engine: &mut Engine, generate_sources: bool) {
 
     // Register everything in the typable command list. Now these are all available
     for command in TYPABLE_COMMAND_LIST {
-        // TODO: This needs to get updated
-        let func = |cx: &mut Context, args: &[Cow<str>]| {
+        let func = move |cx: &mut Context, args: Vec<Cow<'static, str>>| {
             let mut cx = compositor::Context {
                 editor: cx.editor,
                 scroll: None,
                 jobs: cx.jobs,
             };
 
-            (command.fun)(&mut cx, Args::raw(args.to_vec()), PromptEvent::Validate)
+            let mut verified_args = Args::new(command.signature, true);
+            for arg in args {
+                verified_args.push(arg)?;
+            }
+
+            verified_args
+                .finish()
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+
+            (command.fun)(&mut cx, verified_args, PromptEvent::Validate)
         };
 
         module.register_fn(command.name, func);
@@ -677,6 +826,102 @@ fn get_option_value(cx: &mut Context, option: String) -> anyhow::Result<SteelVal
     let pointer = format!("/{}", option.replace('.', "/"));
     let value = config.pointer(&pointer).ok_or_else(key_error)?;
     Ok(value.to_owned().into_steelval().unwrap())
+}
+
+// Indent guides configurations
+fn ig_render(config: &mut IndentGuidesConfig, option: bool) {
+    config.render = option;
+}
+
+fn ig_character(config: &mut IndentGuidesConfig, option: char) {
+    config.character = option;
+}
+
+fn ig_skip_levels(config: &mut IndentGuidesConfig, option: u8) {
+    config.skip_levels = option;
+}
+
+// Whitespace configurations
+fn ws_visible(config: &mut WhitespaceConfig, option: bool) {
+    let value = if option {
+        WhitespaceRenderValue::All
+    } else {
+        WhitespaceRenderValue::None
+    };
+    config.render = WhitespaceRender::Basic(value);
+}
+
+fn ws_chars(config: &mut WhitespaceConfig, option: HashMap<SteelVal, char>) -> anyhow::Result<()> {
+    for (k, v) in option {
+        match k {
+            SteelVal::StringV(s) | SteelVal::SymbolV(s) => match s.as_str() {
+                "space" => config.characters.space = v,
+                "tab" => config.characters.tab = v,
+                "nbsp" => config.characters.nbsp = v,
+                "nnbsp" => config.characters.nnbsp = v,
+                "newline" => config.characters.newline = v,
+                "tabpad" => config.characters.tabpad = v,
+                unknown => anyhow::bail!("Unrecognized key: {}", unknown),
+            },
+            other => anyhow::bail!("Unrecognized key option: {}", other),
+        }
+    }
+    Ok(())
+}
+
+fn ws_render(config: &mut WhitespaceConfig, option: HashMap<SteelVal, bool>) -> anyhow::Result<()> {
+    #[derive(Default)]
+    struct RenderFlags {
+        space: Option<WhitespaceRenderValue>,
+        tab: Option<WhitespaceRenderValue>,
+        nbsp: Option<WhitespaceRenderValue>,
+        nnbsp: Option<WhitespaceRenderValue>,
+        newline: Option<WhitespaceRenderValue>,
+        default: Option<WhitespaceRenderValue>,
+    }
+
+    let mut base = match config.render {
+        WhitespaceRender::Basic(v) => RenderFlags {
+            default: Some(v.clone()),
+            space: Some(v.clone()),
+            nbsp: Some(v.clone()),
+            nnbsp: Some(v.clone()),
+            tab: Some(v.clone()),
+            newline: Some(v.clone()),
+        },
+        WhitespaceRender::Specific { .. } => RenderFlags::default(),
+    };
+
+    for (k, v) in option {
+        let value = if v {
+            WhitespaceRenderValue::All
+        } else {
+            WhitespaceRenderValue::None
+        };
+        match k {
+            SteelVal::StringV(s) | SteelVal::SymbolV(s) => match s.as_str() {
+                "space" => base.space = Some(value),
+                "tab" => base.tab = Some(value),
+                "nbsp" => base.nbsp = Some(value),
+                "nnbsp" => base.nnbsp = Some(value),
+                "newline" => base.newline = Some(value),
+                "default" => base.default = Some(value),
+                unknown => anyhow::bail!("Unrecognized key: {}", unknown),
+            },
+            unknown => anyhow::bail!("Unrecognized key: {}", unknown),
+        }
+    }
+
+    config.render = WhitespaceRender::Specific {
+        default: base.default,
+        space: base.space,
+        nbsp: base.nbsp,
+        nnbsp: base.nnbsp,
+        tab: base.tab,
+        newline: base.newline,
+    };
+
+    Ok(())
 }
 
 // File picker configurations
@@ -774,6 +1019,8 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
         register_lsp_notification_callback,
     );
 
+    module.register_fn("register-lsp-call-handler", register_lsp_call_callback);
+
     module.register_fn("update-configuration!", |ctx: &mut Context| {
         ctx.editor
             .config_events
@@ -816,7 +1063,7 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
     );
 
     module
-        .register_fn("raw-cursor-shape", || CursorShapeConfig::default())
+        .register_fn("raw-cursor-shape", CursorShapeConfig::default)
         .register_fn(
             "raw-cursor-shape-set!",
             |value: SteelVal, mode: String, shape: String| -> anyhow::Result<SteelVal> {
@@ -844,7 +1091,7 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
         );
 
     module
-        .register_fn("raw-file-picker", || FilePickerConfig::default())
+        .register_fn("raw-file-picker", FilePickerConfig::default)
         .register_fn("register-file-picker", HelixConfiguration::file_picker)
         .register_fn("fp-hidden", fp_hidden)
         .register_fn("fp-follow-symlinks", fp_follow_symlinks)
@@ -857,7 +1104,7 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
         .register_fn("fp-max-depth", fp_max_depth);
 
     module
-        .register_fn("raw-soft-wrap", || SoftWrap::default())
+        .register_fn("raw-soft-wrap", SoftWrap::default)
         .register_fn("register-soft-wrap", HelixConfiguration::soft_wrap)
         .register_fn("sw-enable", sw_enable)
         .register_fn("sw-max-wrap", sw_max_wrap)
@@ -866,10 +1113,28 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
         .register_fn("sw-wrap-at-text-width", wrap_at_text_width);
 
     module
+        .register_fn("raw-whitespace", || WhitespaceConfig::default())
+        .register_fn("register-whitespace", HelixConfiguration::whitespace)
+        .register_fn("ws-visible", ws_visible)
+        .register_fn("ws-chars", ws_chars)
+        .register_fn("ws-render", ws_render);
+
+    module
+        .register_fn("raw-indent-guides", || IndentGuidesConfig::default())
+        .register_fn("register-indent-guides", HelixConfiguration::indent_guides)
+        .register_fn("ig-render", ig_render)
+        .register_fn("ig-character", ig_character)
+        .register_fn("ig-skip-levels", ig_skip_levels);
+
+    module
         .register_fn("scrolloff", HelixConfiguration::scrolloff)
         .register_fn("scroll_lines", HelixConfiguration::scroll_lines)
         .register_fn("mouse", HelixConfiguration::mouse)
         .register_fn("shell", HelixConfiguration::shell)
+        .register_fn(
+            "jump-label-alphabet",
+            HelixConfiguration::jump_label_alphabet,
+        )
         .register_fn("line-number", HelixConfiguration::line_number)
         .register_fn("cursorline", HelixConfiguration::cursorline)
         .register_fn("cursorcolumn", HelixConfiguration::cursorcolumn)
@@ -883,7 +1148,7 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
             AutoPairConfig::Pairs(map)
         })
         // TODO: Finish this up
-        .register_fn("auto-save-default", || AutoSave::default())
+        .register_fn("auto-save-default", AutoSave::default)
         .register_fn(
             "auto-save-after-delay-enable",
             HelixConfiguration::auto_save_after_delay_enable,
@@ -927,9 +1192,7 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
         .register_fn("lsp", HelixConfiguration::lsp)
         .register_fn("terminal", HelixConfiguration::terminal)
         .register_fn("rulers", HelixConfiguration::rulers)
-        .register_fn("whitespace", HelixConfiguration::whitespace)
         .register_fn("bufferline", HelixConfiguration::bufferline)
-        .register_fn("indent-guides", HelixConfiguration::indent_guides)
         .register_fn(
             "workspace-lsp-roots",
             HelixConfiguration::workspace_lsp_roots,
@@ -938,7 +1201,8 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
             "default-line-ending",
             HelixConfiguration::default_line_ending,
         )
-        .register_fn("smart-tab", HelixConfiguration::smart_tab);
+        .register_fn("smart-tab", HelixConfiguration::smart_tab)
+        .register_fn("rainbow-brackets", HelixConfiguration::rainbow_brackets);
 
     // Keybinding stuff
     module
@@ -971,6 +1235,28 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
 ;;                                    (lambda (args) (displayln args)))
 ;; ```
 (define register-lsp-notification-handler helix.register-lsp-notification-handler)
+
+(provide register-lsp-call-handler)
+
+;;@doc
+;; Register a callback to be called on LSP calls sent from the server -> client
+;; that aren't currently handled by Helix as a built in.
+;;
+;; ```scheme
+;; (register-lsp-call-handler lsp-name event-name handler)
+;; ```
+;;
+;; * lsp-name : string?
+;; * event-name : string?
+;; * function : (-> hash? any?) ;; Function where the first argument is the parameters
+;;
+;; # Examples
+;; ```
+;; (register-lsp-call-handler "dart"
+;;                                    "dart/textDocument/publishClosingLabels"
+;;                                    (lambda (call-id args) (displayln args)))
+;; ```
+(define register-lsp-call-handler helix.register-lsp-call-handler)
 
 (provide set-option!)
 (define (set-option! key value)
@@ -1088,29 +1374,29 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
             "#,
         );
 
-        builtin_configuration_module.push_str(&format!(
+        builtin_configuration_module.push_str(
             r#"
 (provide update-configuration!)
 (define (update-configuration!)
     (helix.update-configuration! *helix.config*))
 "#,
-        ));
+        );
 
-        builtin_configuration_module.push_str(&format!(
+        builtin_configuration_module.push_str(
             r#"
 (provide get-config-option-value)
 (define (get-config-option-value arg)
     (helix.get-config-option-value *helix.cx* arg))
 "#,
-        ));
+        );
 
-        builtin_configuration_module.push_str(&format!(
+        builtin_configuration_module.push_str(
             r#"
 (provide set-configuration-for-file!)
 (define (set-configuration-for-file! path config)
     (helix.set-configuration-for-file! *helix.cx* path config))
 "#,
-        ));
+        );
 
         builtin_configuration_module.push_str(
             r#"
@@ -1158,13 +1444,49 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
         );
 
         // Register the get keybindings function
-        builtin_configuration_module.push_str(&format!(
+        builtin_configuration_module.push_str(
             r#"
 (provide get-keybindings)
 (define (get-keybindings)
     (helix.get-keybindings *helix.config*))
 "#,
-        ));
+        );
+
+        let mut template_whitespace = |name: &str| {
+            builtin_configuration_module.push_str(&format!(
+                r#"
+(provide {})
+(define ({} arg)
+    (lambda (picker) 
+            (helix.{} picker arg)
+            picker))
+"#,
+                name, name, name
+            ))
+        };
+        let whitespace_functions = &["ws-visible", "ws-chars", "ws-render"];
+
+        for name in whitespace_functions {
+            template_whitespace(name);
+        }
+
+        let mut template_indent_guides = |name: &str| {
+            builtin_configuration_module.push_str(&format!(
+                r#"
+(provide {})
+(define ({} arg)
+    (lambda (picker) 
+            (helix.{} picker arg)
+            picker))
+"#,
+                name, name, name
+            ))
+        };
+        let indent_guides_functions = &["ig-render", "ig-character", "ig-skip-levels"];
+
+        for name in indent_guides_functions {
+            template_indent_guides(name);
+        }
 
         let mut template_soft_wrap = |name: &str| {
             builtin_configuration_module.push_str(&format!(
@@ -1270,7 +1592,7 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
             "#,
         );
 
-        builtin_configuration_module.push_str(&format!(
+        builtin_configuration_module.push_str(
             r#"
 (provide file-picker)
 ;;@doc
@@ -1311,9 +1633,9 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
         *helix.config*
         (foldl (lambda (func config) (func config)) (helix.raw-file-picker) args)))
 "#,
-        ));
+        );
 
-        builtin_configuration_module.push_str(&format!(
+        builtin_configuration_module.push_str(
             r#"
 (provide soft-wrap-kw)
 ;;@doc
@@ -1370,9 +1692,9 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
     (helix.sw-wrap-at-text-width sw wrap-at-text-width)
     (helix.register-soft-wrap *helix.config* sw))
 "#,
-        ));
+        );
 
-        builtin_configuration_module.push_str(&format!(
+        builtin_configuration_module.push_str(
             r#"
 
 (provide soft-wrap)
@@ -1422,6 +1744,95 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
         *helix.config*
         (foldl (lambda (func config) (func config)) (helix.raw-soft-wrap) args)))
 "#,
+        );
+
+        builtin_configuration_module.push_str(&format!(
+            r#"
+
+(provide whitespace)
+;;@doc
+;; Sets the configuration for whitespace using var args.
+;;
+;; ```scheme
+;; (whitespace . args)
+;; ```
+;;
+;; The args are expected to be something of the value:
+;; ```scheme
+;; (-> WhitespaceConfiguration? bool?)    
+;; ```
+;; The options are as follows:
+;;
+;; * ws-visible:
+;;   Show all visible whitespace, defaults to false
+;; * ws-render:
+;;   manually disable or enable characters
+;;   render options (specified in hashmap):
+;;```scheme
+;;   (hash
+;;     'space #f
+;;     'nbsp #f
+;;     'nnbsp #f
+;;     'tab #f
+;;     'newline #f)
+;;```
+;; * ws-chars:
+;;   manually set visible whitespace characters with a hashmap
+;;   character options (specified in hashmap):
+;;```scheme
+;;   (hash
+;;     'space #\·
+;;     'nbsp #\⍽
+;;     'nnbsp #\␣
+;;     'tab #\→
+;;     'newline #\⏎
+;;     ; Tabs will look like "→···" (depending on tab width)
+;;     'tabpad #\·)
+;;```
+;; # Examples
+;; ```scheme
+;; (whitespace (ws-visible #t) (ws-chars (hash 'space #\·)) (ws-render (hash 'tab #f)))
+;; ```
+(define (whitespace . args)
+    (helix.register-whitespace
+        *helix.config*
+        (foldl (lambda (func config) (func config)) (helix.raw-whitespace) args)))
+"#,
+        ));
+
+        builtin_configuration_module.push_str(&format!(
+            r#"
+
+(provide indent-guides)
+;;@doc
+;; Sets the configuration for indent-guides using args
+;;
+;; ```scheme
+;; (indent-guides . args)
+;; ```
+;;
+;; The args are expected to be something of the value:
+;; ```scheme
+;; (-> IndentGuidesConfig? bool?)
+;; ```
+;; The options are as follows:
+;;
+;; * ig-render:
+;;   Show indent guides, defaults to false
+;; * ig-character:
+;;   character used for indent guides, defaults to "╎"
+;; * ig-skip-levels:
+;;   amount of levels to skip, defaults to 1
+;;
+;; # Examples
+;; ```scheme
+;; (indent-guides (ig-render #t) (ig-character #\|) (ig-skip-levels 1))
+;; ```
+(define (indent-guides . args)
+    (helix.register-indent-guides
+        *helix.config*
+        (foldl (lambda (func config) (func config)) (helix.raw-indent-guides) args)))
+"#,
         ));
 
         let mut template_function_arity_1 = |name: &str, doc: &str| {
@@ -1444,7 +1855,8 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
 "),
             ("mouse", "Mouse support. Defaults to true."),
             ("shell", r#"Shell to use for shell commands. Defaults to ["cmd", "/C"] on Windows and ["sh", "-c"] otherwise."#),
-            ("line-number", "Line number mode."),
+            ("jump-label-alphabet", r#"The characters that are used to generate two character jump labels. Characters at the start of the alphabet are used first. Defaults to "abcdefghijklmnopqrstuvwxyz""#),
+            ("line-number", "Line number mode. Defaults to 'absolute, set to 'relative for relative line numbers"),
             ("cursorline", "Highlight the lines cursors are currently on. Defaults to false"),
             ("cursorcolumn", "Highlight the columns cursors are currently on. Defaults to false"),
             ("middle-click-paste", "Middle click paste support. Defaults to true"),
@@ -1483,12 +1895,11 @@ are shown, set to 5 for instant. Defaults to 250ms.
             ("lsp", "Lsp config"),
             ("terminal", "Terminal config"),
             ("rulers", "Column numbers at which to draw the rulers. Defaults to `[]`, meaning no rulers"),
-            ("whitespace", "Whitespace config"),
             ("bufferline", "Persistently display open buffers along the top"),
-            ("indent-guides", "Vertical indent width guides"),
             ("workspace-lsp-roots", "Workspace specific lsp ceiling dirs"),
             ("default-line-ending", "Which line ending to choose for new documents. Defaults to `native`. i.e. `crlf` on Windows, otherwise `lf`."),
             ("smart-tab", "Enables smart tab"),
+            ("rainbow-brackets", "Enabled rainbow brackets"),
             ("keybindings", "Keybindings config"),
             ("inline-diagnostics-cursor-line-enable", "Inline diagnostics cursor line"),
             ("inline-diagnostics-end-of-line-enable", "Inline diagnostics end of line"),
@@ -1586,13 +1997,12 @@ fn theme_from_json_string(name: String, value: SteelVal) -> Result<SteelTheme, a
 
 // Mutate the theme?
 fn add_theme(cx: &mut Context, theme: SteelTheme) {
-    cx.editor
-        .user_defined_themes
-        .insert(theme.0.name().to_owned(), theme.0);
+    Arc::make_mut(&mut cx.editor.theme_loader)
+        .add_dynamic_theme(theme.0.name().to_owned(), theme.0);
 }
 
 fn get_style(theme: &SteelTheme, name: SteelString) -> helix_view::theme::Style {
-    theme.0.get(name.as_str()).clone()
+    theme.0.get(name.as_str())
 }
 
 fn set_style(theme: &mut SteelTheme, name: String, style: helix_view::theme::Style) {
@@ -1726,7 +2136,10 @@ Get the `Rect` associated with the currently focused buffer.
     );
     register_0!(
         "selected-register!",
-        |cx: &mut Context| cx.editor.selected_register.unwrap_or(cx.editor.config().default_yank_register),
+        |cx: &mut Context| cx
+            .editor
+            .selected_register
+            .unwrap_or(cx.editor.config().default_yank_register),
         r#"Get currently selected register"#
     );
 
@@ -1748,10 +2161,24 @@ Get the `Rect` associated with the currently focused buffer.
         },
     );
 
+    module.register_fn("editor-document->language", cx_get_document_language);
+
     module.register_fn(
         "editor-document-dirty?",
         |cx: &mut Context, doc: DocumentId| -> Option<bool> {
             cx.editor.documents.get(&doc).map(|x| x.is_modified())
+        },
+    );
+
+    module.register_fn(
+        "editor-document-reload",
+        |cx: &mut Context, doc: DocumentId| -> anyhow::Result<()> {
+            for (view, _) in cx.editor.tree.views_mut() {
+                if let Some(x) = cx.editor.documents.get_mut(&doc) {
+                    x.reload(view, &cx.editor.diff_providers)?;
+                }
+            }
+            Ok(())
         },
     );
 
@@ -1842,9 +2269,16 @@ Get the `Rect` associated with the currently focused buffer.
         );
 
         template_function_arity_1(
+            "editor-document->language",
+            "Get the language for the document",
+        );
+
+        template_function_arity_1(
             "editor-document-dirty?",
             "Check if a document has unsaved changes",
         );
+
+        template_function_arity_1("editor-document-reload", "Reload a document.");
 
         template_function_arity_1("editor->text", "Get the document as a rope.");
         template_function_arity_1("editor-document->path", "Get the path to a document.");
@@ -1937,7 +2371,7 @@ impl super::PluginSystem for SteelScriptingEngine {
         cxt: &mut Context,
         event: KeyEvent,
     ) -> Option<KeymapResult> {
-        SteelScriptingEngine::handle_keymap_event_impl(&self, editor, mode, cxt, event)
+        SteelScriptingEngine::handle_keymap_event_impl(self, editor, mode, cxt, event)
     }
 
     fn call_function_by_name(&self, cx: &mut Context, name: &str, args: &[Cow<str>]) -> bool {
@@ -2033,10 +2467,10 @@ impl super::PluginSystem for SteelScriptingEngine {
                     let mut ctx = Context {
                         register: None,
                         count: None,
-                        editor: &mut cx.editor,
+                        editor: cx.editor,
                         callback: Vec::new(),
                         on_next_key_callback: None,
-                        jobs: &mut cx.jobs,
+                        jobs: cx.jobs,
                     };
 
                     enter_engine(|x| present_error_inside_engine_context(&mut ctx, x, e));
@@ -2112,14 +2546,11 @@ impl super::PluginSystem for SteelScriptingEngine {
                 if let Some(value) = module.documentation().get(name) {
                     found_definitions.insert(name.to_string());
 
-                    match value {
-                        steel::steel_vm::builtin::Documentation::Markdown(m) => {
-                            let escaped = name.replace("*", "\\*");
-                            writeln!(&mut writer, "### **{}**", escaped).unwrap();
+                    if let steel::steel_vm::builtin::Documentation::Markdown(m) = value {
+                        let escaped = name.replace("*", "\\*");
+                        writeln!(&mut writer, "### **{}**", escaped).unwrap();
 
-                            format_markdown_doc(&mut writer, &m.0);
-                        }
-                        _ => {}
+                        format_markdown_doc(&mut writer, &m.0);
                     }
                 }
             }
@@ -2134,70 +2565,111 @@ impl super::PluginSystem for SteelScriptingEngine {
 
     // TODO: Should this just be a hook / event instead of a function like this?
     // Handle an LSP notification, assuming its been sent through
-    fn handle_lsp_notification(
+    fn handle_lsp_call(
         &self,
         cx: &mut compositor::Context,
         server_id: helix_lsp::LanguageServerId,
         event_name: String,
+        call_id: jsonrpc::Id,
         params: helix_lsp::jsonrpc::Params,
-    ) -> bool {
-        if let Err(e) = enter_engine(|guard| {
-            {
-                let mut ctx = Context {
-                    register: None,
-                    count: None,
-                    editor: &mut cx.editor,
-                    callback: Vec::new(),
-                    on_next_key_callback: None,
-                    jobs: &mut cx.jobs,
-                };
+    ) -> Option<Result<serde_json::Value, jsonrpc::Error>> {
+        let mut ctx = Context {
+            register: None,
+            count: None,
+            editor: cx.editor,
+            callback: Vec::new(),
+            on_next_key_callback: None,
+            jobs: cx.jobs,
+        };
 
-                let language_server_name = ctx
-                    .editor
-                    .language_servers
-                    .get_by_id(server_id)
-                    .map(|x| x.name().to_owned());
+        let language_server_name = ctx
+            .editor
+            .language_servers
+            .get_by_id(server_id)
+            .map(|x| x.name().to_owned());
 
-                if language_server_name.is_none() {
-                    ctx.editor.set_error("Unable to find language server");
+        if language_server_name.is_none() {
+            ctx.editor.set_error("Unable to find language server");
+        }
+
+        let language_server_name = language_server_name.unwrap();
+
+        let mut pass_call_id = false;
+
+        let function = LSP_CALL_REGISTRY
+            .read()
+            .unwrap()
+            .get(&(language_server_name, event_name))
+            .map(|x| match x {
+                LspKind::Call(rooted_steel_val) => {
+                    pass_call_id = true;
+                    rooted_steel_val.value()
                 }
+                LspKind::Notification(rooted_steel_val) => rooted_steel_val.value(),
+            })
+            .cloned();
 
-                let language_server_name = language_server_name.unwrap();
+        let result = if let Some(function) = function {
+            enter_engine(|guard| {
+                // Install the interrupt handler, in the event this thing
+                // is blocking for too long.
+                with_interrupt_handler(|| {
+                    guard
+                        .with_mut_reference::<Context, Context>(&mut ctx)
+                        .consume(move |engine, arguments| {
+                            let context = arguments[0].clone();
+                            engine.update_value("*helix.cx*", context);
 
-                let function = LSP_NOTIFICATION_REGISTRY
-                    .read()
-                    .unwrap()
-                    .get(&(language_server_name, event_name))
-                    .map(|x| x.value())
-                    .cloned();
+                            let params = serde_json::to_value(&params)
+                                .map_err(|e| SteelErr::new(ErrorKind::Generic, e.to_string()))
+                                .and_then(|x| x.into_steelval())?;
 
-                if let Some(function) = function {
-                    // Install the interrupt handler, in the event this thing
-                    // is blocking for too long.
-                    with_interrupt_handler(|| {
-                        guard
-                            .with_mut_reference::<Context, Context>(&mut ctx)
-                            .consume(move |engine, arguments| {
-                                let context = arguments[0].clone();
-                                engine.update_value("*helix.cx*", context);
-
-                                let params = serde_json::to_value(&params)
+                            if pass_call_id {
+                                let call_id = serde_json::to_value(&call_id)
                                     .map_err(|e| SteelErr::new(ErrorKind::Generic, e.to_string()))
                                     .and_then(|x| x.into_steelval())?;
 
-                                let args = vec![params];
+                                let mut arguments = [call_id, params];
 
-                                engine.call_function_with_args(function.clone(), args)
-                            })
-                    })
-                } else {
-                    Ok(SteelVal::Void)
+                                engine.call_function_with_args_from_mut_slice(
+                                    function.clone(),
+                                    &mut arguments,
+                                )
+                            } else {
+                                let mut arguments = [params];
+                                engine.call_function_with_args_from_mut_slice(
+                                    function.clone(),
+                                    &mut arguments,
+                                )
+                            }
+                        })
+                })
+            })
+        } else {
+            Ok(SteelVal::Void)
+        };
+
+        let value = match result {
+            Err(e) => {
+                cx.editor.set_error(format!("{}", e));
+                Some(SteelVal::Void)
+            }
+            Ok(value) => Some(value),
+        }?;
+
+        match value {
+            SteelVal::Void => None,
+            value => {
+                let serde_value: Result<serde_json::Value, ::steel::SteelErr> = value.try_into();
+                match serde_value {
+                    Ok(serialized_value) => Some(Ok(serialized_value)),
+                    Err(error) => {
+                        log::warn!("Failed to serialize a SteelVal: {}", error);
+                        None
+                    }
                 }
             }
-        }) {
-            cx.editor.set_error(format!("{}", e));
         }
-        true
     }
 }
 
@@ -2224,9 +2696,7 @@ impl SteelScriptingEngine {
         let doc_id = {
             let current_focus = cx.editor.tree.focus;
             let view = cx.editor.tree.get(current_focus);
-            let doc = &view.doc;
-
-            doc
+            &view.doc
         };
 
         if let Some(extension) = extension {
@@ -2568,6 +3038,10 @@ impl HelixConfiguration {
             existing_config.workspace_lsp_roots = Some(workspace_lsp_roots);
         }
 
+        if let Some(rainbow) = new_config.rainbow_brackets {
+            existing_config.rainbow_brackets = Some(rainbow);
+        }
+
         if persistent_diagnostic_sources_present {
             existing_config.persistent_diagnostic_sources =
                 new_config.persistent_diagnostic_sources;
@@ -2700,7 +3174,7 @@ impl HelixConfiguration {
         let config = config.config;
 
         for lconfig in loader.language_configs_mut() {
-            if &lconfig.language_id == &config.language_id {
+            if lconfig.language_id == config.language_id {
                 if let Some(inner) = Arc::get_mut(lconfig) {
                     *inner = config;
                 } else {
@@ -2756,11 +3230,26 @@ impl HelixConfiguration {
         self.store_config(app_config);
     }
 
-    // TODO: Make this a symbol, probably!
-    fn line_number(&self, mode: LineNumber) {
+    fn jump_label_alphabet(&self, alphabet: String) {
         let mut app_config = self.load_config();
-        app_config.editor.line_number = mode;
+        app_config.editor.jump_label_alphabet = alphabet.chars().collect();
         self.store_config(app_config);
+    }
+
+    fn line_number(&self, mode_config: SteelVal) -> anyhow::Result<()> {
+        let config = match mode_config {
+            SteelVal::StringV(s) | SteelVal::SymbolV(s) => match s.as_str() {
+                "relative" => LineNumber::Relative,
+                "absolute" => LineNumber::Absolute,
+                other => anyhow::bail!("Unrecognized line-number option: {}", other),
+            },
+            other => anyhow::bail!("Unrecognized line-number option: {}", other),
+        };
+
+        let mut app_config = self.load_config();
+        app_config.editor.line_number = config;
+        self.store_config(app_config);
+        Ok(())
     }
 
     fn cursorline(&self, option: bool) {
@@ -3005,6 +3494,12 @@ impl HelixConfiguration {
     fn smart_tab(&self, config: Option<SmartTabConfig>) {
         let mut app_config = self.load_config();
         app_config.editor.smart_tab = config;
+        self.store_config(app_config);
+    }
+
+    fn rainbow_brackets(&self, config: bool) {
+        let mut app_config = self.load_config();
+        app_config.editor.rainbow_brackets = config;
         self.store_config(app_config);
     }
 }
@@ -3455,8 +3950,7 @@ fn register_hook(event_kind: String, callback_fn: SteelVal) -> steel::UnRecovera
 
 fn configure_lsp_globals() {
     use std::fmt::Write;
-    let steel_lsp_home = steel_lsp_home_dir();
-    let mut path = PathBuf::from(steel_lsp_home);
+    let mut path = steel_lsp_home_dir();
     path.push("_helix-global-builtins.scm");
 
     let mut output = String::new();
@@ -3485,7 +3979,7 @@ fn configure_lsp_globals() {
         writeln!(&mut output, "(#%register-global '{})", value).unwrap();
     }
 
-    writeln!(&mut output, "").unwrap();
+    writeln!(&mut output).unwrap();
     let search_path = helix_loader::config_dir();
     let search_path_str = search_path.to_str().unwrap();
 
@@ -3518,9 +4012,8 @@ fn configure_lsp_globals() {
 
 fn configure_lsp_builtins(name: &str, module: &BuiltInModule) {
     use std::fmt::Write;
-    let steel_lsp_home = steel_lsp_home_dir();
-    let mut path = PathBuf::from(steel_lsp_home);
-    path.push(&format!("_helix-{}-builtins.scm", name));
+    let mut path = steel_lsp_home_dir();
+    path.push(format!("_helix-{}-builtins.scm", name));
 
     let mut output = String::new();
 
@@ -3600,6 +4093,45 @@ fn load_misc_api(engine: &mut Engine, generate_sources: bool) {
     template_function_arity_0(
         "cursor-position",
         "Returns the cursor position within the current buffer as an integer",
+    );
+
+    module.register_fn("get-active-lsp-clients", get_active_lsp_clients);
+    template_function_arity_0(
+        "get-active-lsp-clients",
+        "Get all language servers, that are attached to the current buffer",
+    );
+
+    let mut template_function_no_context = |name: &str, doc: &str| {
+        if generate_sources {
+            let docstring = format_docstring(doc);
+
+            builtin_misc_module.push_str(&format!(
+                r#"
+(provide {})
+;;@doc
+{}
+(define {} helix.{})                
+            "#,
+                name, docstring, name, name
+            ))
+        }
+    };
+
+    template_function_no_context(
+        "mode-switch-old",
+        "Return the old mode from the event payload",
+    );
+    template_function_no_context(
+        "mode-switch-new",
+        "Return the new mode from the event payload",
+    );
+
+    module.register_fn("lsp-client-name", lsp_client_name);
+    template_function_no_context("lsp-client-name", "Get the name of the lsp client");
+    module.register_fn("lsp-client-offset-encoding", lsp_client_offset_encoding);
+    template_function_no_context(
+        "lsp-client-offset-encoding",
+        "Get the offset encoding of the lsp client",
     );
 
     let mut template_function_arity_1 = |name: &str, doc: &str| {
@@ -3720,6 +4252,7 @@ callback : (-> any?)
     );
 
     module.register_fn("send-lsp-command", send_arbitrary_lsp_command);
+    module.register_fn("send-lsp-notification", send_arbitrary_lsp_notification);
     if generate_sources {
         builtin_misc_module.push_str(
             r#"
@@ -3742,6 +4275,59 @@ callback : (-> any?)
     ;; ```
     (define (send-lsp-command lsp-name method-name params callback)
         (helix.send-lsp-command *helix.cx* lsp-name method-name params callback))
+            "#,
+        );
+    }
+
+    if generate_sources {
+        builtin_misc_module.push_str(
+            r#"
+    (provide send-lsp-notification)
+    ;;@doc
+    ;; Send an LSP notification. The `lsp-name` must correspond to an active LSP.
+    ;; The method name corresponds to the method name that you'd expect to see
+    ;; with the LSP, and the params can be passed as a hash table. Unlike
+    ;; `send-lsp-command`, this does not expect a response and is used for
+    ;; fire-and-forget notifications.
+    ;; 
+    ;; # Example
+    ;; ```scheme
+    ;; (send-lsp-notification "copilot"
+    ;;                        "textDocument/didShowCompletion"
+    ;;                        (hash "item"
+    ;;                              (hash "insertText" "a helpful suggestion"
+    ;;                                    "range" (hash "start" (hash "line" 1 "character" 0)
+    ;;                                                  "end" (hash "line" 1 "character" 2)))))
+    ;; ```
+    (define (send-lsp-notification lsp-name method-name params)
+        (helix.send-lsp-notification *helix.cx* lsp-name method-name params))
+            "#,
+        );
+    }
+
+    module.register_fn("lsp-reply-ok", lsp_reply_ok);
+    if generate_sources {
+        builtin_misc_module.push_str(
+            r#"
+    (provide lsp-reply-ok)
+    ;;@doc
+    ;; Send a successful reply to an LSP request with the given result.
+    ;;
+    ;; ```scheme
+    ;; (lsp-reply-ok lsp-name request-id result)
+    ;; ```
+    ;; 
+    ;; * lsp-name : string? - Name of the language server
+    ;; * request-id : string? - ID of the request to respond to  
+    ;; * result : any? - The result value to send back
+    ;;
+    ;; # Examples
+    ;; ```scheme
+    ;; ;; Reply to a request with id "123" from rust-analyzer
+    ;; (lsp-reply-ok "rust-analyzer" "123" (hash "result" "value"))
+    ;; ```
+    (define (lsp-reply-ok lsp-name request-id result)
+        (helix.lsp-reply-ok *helix.cx* lsp-name request-id result))    
             "#,
         );
     }
@@ -3940,11 +4526,7 @@ last-line : int?
 // LSP can go find it. When it comes to loading though, it'll look
 // up internally.
 pub fn alternative_runtime_search_path() -> Option<PathBuf> {
-    if let Some(path) = steel_home() {
-        Some(PathBuf::from(path).join("cogs").join("helix"))
-    } else {
-        None
-    }
+    steel_home().map(|path| PathBuf::from(path).join("cogs").join("helix"))
 }
 
 pub fn generate_cog_file() {
@@ -4050,7 +4632,7 @@ pub fn load_ext_api(engine: &mut Engine, generate_sources: bool) {
 
             target_directory.push("ext.scm");
 
-            std::fs::write(target_directory, &ext_api).unwrap();
+            std::fs::write(target_directory, ext_api).unwrap();
         }
     }
 
@@ -4228,7 +4810,7 @@ fn configure_engine_impl(mut engine: Engine) -> Engine {
                 .collect::<Vec<SteelVal>>();
         }
 
-        return Vec::new();
+        Vec::new()
     });
 
     // Find the workspace
@@ -4470,13 +5052,35 @@ fn remove_selection_range(cx: &mut Context, index: usize) {
 
 fn current_line_number(cx: &mut Context) -> usize {
     let (view, doc) = current_ref!(cx.editor);
+    doc.text().char_to_line(
+        doc.selection(view.id)
+            .primary()
+            .cursor(doc.text().slice(..)),
+    )
+}
+
+fn current_column_number(cx: &mut Context) -> usize {
+    let (view, doc) = current_ref!(cx.editor);
     helix_core::coords_at_pos(
         doc.text().slice(..),
         doc.selection(view.id)
             .primary()
             .cursor(doc.text().slice(..)),
     )
-    .row
+    .col
+}
+
+fn current_line_character(cx: &mut Context, encoding: SteelString) -> anyhow::Result<usize> {
+    let (view, doc) = current_ref!(cx.editor);
+
+    let encoding = match &***encoding {
+        "utf-8" => helix_lsp::OffsetEncoding::Utf8,
+        "utf-16" => helix_lsp::OffsetEncoding::Utf16,
+        "utf-32" => helix_lsp::OffsetEncoding::Utf32,
+        _ => anyhow::bail!("invalid encoding {encoding:?}"),
+    };
+
+    Ok(doc.position(view.id, encoding).character as usize)
 }
 
 fn get_selection(cx: &mut Context) -> String {
@@ -4717,6 +5321,13 @@ fn cx_editor_all_documents(cx: &mut Context) -> Vec<DocumentId> {
     cx.editor.documents.keys().copied().collect()
 }
 
+fn cx_get_document_language(cx: &mut Context, doc_id: DocumentId) -> Option<String> {
+    cx.editor
+        .documents
+        .get(&doc_id)
+        .and_then(|d| Some(d.language_name()?.to_string()))
+}
+
 fn cx_switch(cx: &mut Context, doc_id: DocumentId) {
     cx.editor.switch(doc_id, Action::VerticalSplit)
 }
@@ -4913,11 +5524,8 @@ fn await_value(cx: &mut Context, value: SteelVal, callback_fn: SteelVal) {
 }
 // Check that we successfully created a directory?
 fn create_directory(path: String) {
-    let path = helix_stdx::path::canonicalize(&PathBuf::from(path));
-
-    if path.exists() {
-        return;
-    } else {
+    let path = helix_stdx::path::canonicalize(&path);
+    if !path.exists() {
         std::fs::create_dir(path).unwrap();
     }
 }
@@ -4929,9 +5537,7 @@ pub fn cx_pos_within_text(cx: &mut Context) -> usize {
 
     let selection = doc.selection(view.id).clone();
 
-    let pos = selection.primary().cursor(text);
-
-    pos
+    selection.primary().cursor(text)
 }
 
 pub fn get_helix_cwd(_cx: &mut Context) -> Option<String> {
@@ -5097,6 +5703,40 @@ fn move_window_to_the_right(cx: &mut Context) {
     {}
 }
 
+#[derive(Debug, Clone)]
+struct LspClient(Weak<helix_lsp::Client>);
+
+impl LspClient {
+    fn new(client: Arc<helix_lsp::Client>) -> Self {
+        LspClient(Arc::downgrade(&client))
+    }
+}
+
+impl Custom for LspClient {}
+
+fn get_active_lsp_clients(cx: &mut Context) -> SteelVal {
+    let (_, doc) = current!(cx.editor);
+    SteelVal::ListV(
+        doc.arc_language_servers()
+            .map(|client| LspClient::new(client).into_steelval().unwrap())
+            .collect(),
+    )
+}
+
+fn lsp_client_name(client: LspClient) -> Option<String> {
+    let client = client.0.upgrade();
+    client.map(|client| client.name().to_owned())
+}
+
+fn lsp_client_offset_encoding(client: LspClient) -> Option<&'static str> {
+    let client = client.0.upgrade();
+    client.map(|client| match client.offset_encoding() {
+        helix_lsp::OffsetEncoding::Utf8 => "utf-8",
+        helix_lsp::OffsetEncoding::Utf16 => "utf-16",
+        helix_lsp::OffsetEncoding::Utf32 => "utf-32",
+    })
+}
+
 fn send_arbitrary_lsp_command(
     cx: &mut Context,
     name: SteelString,
@@ -5138,6 +5778,39 @@ fn send_arbitrary_lsp_command(
     create_callback(cx, future, rooted)?;
 
     Ok(())
+}
+
+fn lsp_reply_ok(
+    cx: &mut Context,
+    name: SteelString,
+    id: SteelString,
+    result: SteelVal,
+) -> anyhow::Result<()> {
+    let serde_value: Result<serde_json::Value, steel::SteelErr> = result.try_into();
+    let value = match serde_value {
+        Ok(serialized_value) => serialized_value,
+        Err(error) => {
+            log::warn!("Failed to serialize a SteelVal: {}", error);
+            serde_json::Value::Null
+        }
+    };
+
+    let (_view, doc) = current!(cx.editor);
+
+    let language_server_id = anyhow::Context::context(
+        doc.language_servers().find(|x| x.name() == name.as_str()),
+        "Unable to find the language server specified!",
+    )?
+    .id();
+
+    cx.editor
+        .language_server_by_id(language_server_id)
+        .ok_or(anyhow::anyhow!("Failed to find a language server by id"))
+        .and_then(|language_server| {
+            language_server
+                .reply(jsonrpc::Id::Str(id.to_string()), Ok(value))
+                .map_err(Into::into)
+        })
 }
 
 fn create_callback<T: TryInto<SteelVal, Error = SteelErr> + 'static>(
@@ -5205,28 +5878,25 @@ pub fn add_inlay_hint(
     let view = cx.editor.tree.get(view_id);
     let doc_id = cx.editor.tree.get(view_id).doc;
     let doc = cx.editor.documents.get_mut(&doc_id)?;
-    let mut new_inlay_hints = doc
-        .inlay_hints(view_id)
-        .map(|x| x.clone())
-        .unwrap_or_else(|| {
-            let doc_text = doc.text();
-            let len_lines = doc_text.len_lines();
+    let mut new_inlay_hints = doc.inlay_hints(view_id).cloned().unwrap_or_else(|| {
+        let doc_text = doc.text();
+        let len_lines = doc_text.len_lines();
 
-            let view_height = view.inner_height();
-            let first_visible_line =
-                doc_text.char_to_line(doc.view_offset(view_id).anchor.min(doc_text.len_chars()));
-            let first_line = first_visible_line.saturating_sub(view_height);
-            let last_line = first_visible_line
-                .saturating_add(view_height.saturating_mul(2))
-                .min(len_lines);
+        let view_height = view.inner_height();
+        let first_visible_line =
+            doc_text.char_to_line(doc.view_offset(view_id).anchor.min(doc_text.len_chars()));
+        let first_line = first_visible_line.saturating_sub(view_height);
+        let last_line = first_visible_line
+            .saturating_add(view_height.saturating_mul(2))
+            .min(len_lines);
 
-            let new_doc_inlay_hints_id = DocumentInlayHintsId {
-                first_line,
-                last_line,
-            };
+        let new_doc_inlay_hints_id = DocumentInlayHintsId {
+            first_line,
+            last_line,
+        };
 
-            DocumentInlayHints::empty_with_id(new_doc_inlay_hints_id)
-        });
+        DocumentInlayHints::empty_with_id(new_doc_inlay_hints_id)
+    });
 
     // TODO: The inlay hints should actually instead return the id?
     new_inlay_hints
@@ -5285,7 +5955,7 @@ pub fn remove_inlay_hint_by_id(
         return Some(());
     }
 
-    return None;
+    None
 }
 
 // "remove-inlay-hint",
@@ -5311,4 +5981,16 @@ pub fn remove_inlay_hint(cx: &mut Context, char_index: usize, _completion: Steel
         .retain(|x| x.char_idx != char_index);
     doc.set_inlay_hints(view_id, new_inlay_hints);
     true
+}
+
+pub fn insert_string(cx: &mut Context, string: SteelString) {
+    let (view, doc) = current!(cx.editor);
+
+    let indent = Tendril::from(string.as_str());
+    let transaction = Transaction::insert(
+        doc.text(),
+        &doc.selection(view.id).clone().cursors(doc.text().slice(..)),
+        indent,
+    );
+    doc.apply(&transaction, view.id);
 }

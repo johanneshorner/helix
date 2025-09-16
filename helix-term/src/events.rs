@@ -4,6 +4,13 @@ use helix_view::events::{
     ConfigDidChange, DiagnosticsDidChange, DocumentDidChange, DocumentDidClose, DocumentDidOpen,
     DocumentFocusLost, DocumentSaved, LanguageServerExited, LanguageServerInitialized,
     SelectionDidChange,
+    //
+ // DiagnosticsDidChange, DocumentDidChange, DocumentDidClose, DocumentDidOpen, DocumentFocusLost,
+ // LanguageServerExited, LanguageServerInitialized, SelectionDidChange,
+ //
+    //  ConfigDidChange, DiagnosticsDidChange, DocumentDidChange, DocumentDidClose, DocumentDidOpen,
+    // DocumentFocusLost, DocumentSaved, LanguageServerExited, LanguageServerInitialized,
+    // SelectionDidChange,
 };
 
 use crate::commands;

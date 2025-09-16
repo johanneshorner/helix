@@ -2,6 +2,7 @@ use arc_swap::{access::Map, ArcSwap};
 use futures_util::Stream;
 use helix_core::{diagnostic::Severity, pos_at_coords, syntax, Range, Selection};
 use helix_lsp::{
+    jsonrpc,
     lsp::{self, notification::Notification},
     util::lsp_range_to_range,
     LanguageServerId, LspProgressMap,
@@ -895,16 +896,18 @@ impl Application {
                         self.editor.language_servers.remove_by_id(server_id);
                     }
                     Notification::Other(event_name, params) => {
-                        let server_id = server_id;
-
                         let mut cx = crate::compositor::Context {
                             editor: &mut self.editor,
                             scroll: None,
                             jobs: &mut self.jobs,
                         };
 
-                        ScriptingEngine::handle_lsp_notification(
-                            &mut cx, server_id, event_name, params,
+                        ScriptingEngine::handle_lsp_call(
+                            &mut cx,
+                            server_id,
+                            event_name,
+                            jsonrpc::Id::Null,
+                            params,
                         );
                     }
                 }
@@ -1060,6 +1063,32 @@ impl Application {
                         let result = self.handle_show_document(params, offset_encoding);
                         Ok(json!(result))
                     }
+                    Ok(MethodCall::Other(event_name, params)) => {
+                        let mut cx = crate::compositor::Context {
+                            editor: &mut self.editor,
+                            scroll: None,
+                            jobs: &mut self.jobs,
+                        };
+
+                        let reply = ScriptingEngine::handle_lsp_call(
+                            &mut cx,
+                            server_id,
+                            event_name,
+                            id.clone(),
+                            params,
+                        );
+
+                        if let Some(reply) = reply {
+                            let language_server = language_server!();
+                            if let Err(err) = language_server.reply(id.clone(), reply) {
+                                log::error!(
+                                    "Failed to send reply to server '{}' request {id}: {err}",
+                                    language_server.name()
+                                );
+                            }
+                        };
+                        return;
+                    }
                 };
 
                 let language_server = language_server!();
@@ -1070,6 +1099,7 @@ impl Application {
                     );
                 }
             }
+
             Call::Invalid { id } => log::error!("LSP invalid method call id={:?}", id),
         }
     }

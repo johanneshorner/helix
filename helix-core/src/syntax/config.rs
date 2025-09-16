@@ -7,6 +7,7 @@ use serde::{ser::SerializeSeq as _, Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fmt::{self, Display},
+    num::NonZeroU8,
     path::PathBuf,
     str::FromStr,
 };
@@ -19,7 +20,7 @@ pub struct Configuration {
     pub language_server: HashMap<String, LanguageServerConfiguration>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct LanguageConfiguration {
     #[serde(skip)]
@@ -60,6 +61,8 @@ pub struct LanguageConfiguration {
 
     /// If set, overrides `editor.path-completion`.
     pub path_completion: Option<bool>,
+    /// If set, overrides `editor.word-completion`.
+    pub word_completion: Option<WordCompletion>,
 
     #[serde(default)]
     pub diagnostic_severity: Severity,
@@ -98,6 +101,8 @@ pub struct LanguageConfiguration {
     pub workspace_lsp_roots: Option<Vec<PathBuf>>,
     #[serde(default)]
     pub persistent_diagnostic_sources: Vec<String>,
+    /// Overrides the `editor.rainbow-brackets` config key for the language.
+    pub rainbow_brackets: Option<bool>,
 }
 
 impl LanguageConfiguration {
@@ -572,6 +577,13 @@ pub struct SoftWrap {
     pub wrap_at_text_width: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct WordCompletion {
+    pub enable: Option<bool>,
+    pub trigger_length: Option<NonZeroU8>,
+}
+
 fn deserialize_regex<'de, D>(deserializer: D) -> Result<Option<rope::Regex>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -614,35 +626,4 @@ where
 
 pub fn default_timeout() -> u64 {
     20
-}
-
-impl Clone for LanguageConfiguration {
-    fn clone(&self) -> Self {
-        LanguageConfiguration {
-            language: self.language.clone(),
-            language_id: self.language_id.clone(),
-            language_server_language_id: self.language_server_language_id.clone(),
-            scope: self.scope.clone(),
-            file_types: self.file_types.clone(),
-            shebangs: self.shebangs.clone(),
-            roots: self.roots.clone(),
-            comment_tokens: self.comment_tokens.clone(),
-            block_comment_tokens: self.block_comment_tokens.clone(),
-            text_width: self.text_width.clone(),
-            soft_wrap: self.soft_wrap.clone(),
-            auto_format: self.auto_format.clone(),
-            formatter: self.formatter.clone(),
-            diagnostic_severity: self.diagnostic_severity.clone(),
-            grammar: self.grammar.clone(),
-            injection_regex: self.injection_regex.clone(),
-            language_servers: self.language_servers.clone(),
-            indent: self.indent.clone(),
-            debugger: self.debugger.clone(),
-            auto_pairs: self.auto_pairs.clone(),
-            rulers: self.rulers.clone(),
-            workspace_lsp_roots: self.workspace_lsp_roots.clone(),
-            persistent_diagnostic_sources: self.persistent_diagnostic_sources.clone(),
-            path_completion: self.path_completion,
-        }
-    }
 }

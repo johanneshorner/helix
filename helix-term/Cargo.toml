@@ -31,11 +31,11 @@ assets = [
 ]
 
 [features]
-default = ["git", "steel"] # Remove steel if you don't want it
+default = ["git"] # Add steel here for development
 unicode-lines = ["helix-core/unicode-lines", "helix-view/unicode-lines"]
 integration = ["helix-event/integration_test"]
 git = ["helix-vcs/git"]
-steel = ["dep:steel-core", "helix-core/steel", "helix-view/steel", "tui/steel"]
+steel = ["dep:steel-core", "dep:steel-doc", "helix-core/steel", "helix-view/steel", "tui/steel", "helix-lsp/steel"]
 
 [[bin]]
 name = "hx"
@@ -83,7 +83,7 @@ open = "5.3.2"
 url = "2.5.4"
 
 # config
-toml = "0.8"
+toml.workspace = true
 
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -94,10 +94,10 @@ grep-searcher = "0.1.14"
 
 # plugin support
 steel-core = { workspace = true, optional = true }
-steel-doc = { git = "https://github.com/mattwparas/steel.git", version = "0.7.0" }
-# steel-doc = { path = "/home/matt/code/scratch/steel/crates/steel-doc", version = "0.6.0" }
+steel-doc = { git = "https://github.com/mattwparas/steel.git", version = "0.7.0", optional = true }
 
 globset = "0.4.16"
+dashmap = "6.0"
 
 [target.'cfg(not(windows))'.dependencies]  # https://github.com/vorner/signal-hook/issues/100
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }

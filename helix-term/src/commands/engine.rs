@@ -12,10 +12,7 @@ use crate::{
     ui::{self, PromptEvent},
 };
 
-use super::{Context, MappableCommand, TYPABLE_COMMAND_LIST};
-
-#[cfg(feature = "steel")]
-mod components;
+use super::Context;
 
 #[cfg(feature = "steel")]
 pub mod steel;
@@ -141,21 +138,29 @@ impl ScriptingEngine {
             .collect()
     }
 
-    pub fn handle_lsp_notification(
+    pub fn handle_lsp_call(
         cx: &mut compositor::Context,
         server_id: LanguageServerId,
         event_name: String,
+        call_id: jsonrpc::Id,
         params: jsonrpc::Params,
-    ) {
+    ) -> Option<Result<serde_json::Value, jsonrpc::Error>> {
         for kind in PLUGIN_PRECEDENCE {
-            if manual_dispatch!(
+            if let Some(value) = manual_dispatch!(
                 kind,
-                // TODO: Get rid of these clones!
-                handle_lsp_notification(cx, server_id, event_name.clone(), params.clone())
+                handle_lsp_call(
+                    cx,
+                    server_id,
+                    event_name.clone(),
+                    call_id.clone(),
+                    params.clone()
+                )
             ) {
-                return;
+                return Some(value);
             }
         }
+
+        None
     }
 
     pub fn generate_sources() {
@@ -229,14 +234,15 @@ pub trait PluginSystem {
     /// Call into the scripting engine to handle an unhandled LSP notification, sent from the server
     /// to the client.
     #[inline(always)]
-    fn handle_lsp_notification(
+    fn handle_lsp_call(
         &self,
         _cx: &mut compositor::Context,
         _server_id: LanguageServerId,
         _event_name: String,
+        _call_id: jsonrpc::Id,
         _params: jsonrpc::Params,
-    ) -> bool {
-        false
+    ) -> Option<Result<serde_json::Value, jsonrpc::Error>> {
+        None
     }
 
     /// Given an identifier, extract the documentation from the engine.

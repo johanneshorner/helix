@@ -14,6 +14,15 @@ To install the `hx` executable, with steel as a plugin language. This also inclu
 
 The `steel` executable, the steel language server, the steel dylib installer, and the steel package manager `forge`.
 
+## Developing
+
+The easiest way to contribute would be to adjust the default features on the `helix-term` crate:
+
+```toml
+[features]
+features = ["git", "steel"]
+```
+
 ## Setting up configurations for helix
 
 There are 2 important files you'll want, which should be auto generated during the installation process if they don't already exist:
@@ -225,7 +234,7 @@ off on to another thread to run some code. Consider the following example which 
 
 
 ```scheme
-(spawn-native-thread (lambda () (sleep/ms 1000) (theme "focus_nova"))) ;; Note, this won't work!
+(spawn-native-thread (lambda () (time/sleep-ms 1000) (theme "focus_nova"))) ;; Note, this won't work!
 ```
 
 This appears to spawn a thread, sleep for 1 second, and then change the theme. The issue here is that this thread does not
@@ -240,7 +249,7 @@ have control over the helix context. So what we'll have to do instead, is schedu
   (lambda ()
     (hx.block-on-task
       (lambda ()
-        (sleep/ms 1000)
+        (time/sleep-ms 1000)
         (theme "focus_nova")))))
 ```
 
